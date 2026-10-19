@@ -1,7 +1,10 @@
 package jinja
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"io"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -12,6 +15,7 @@ import (
 	"github.com/bruin-data/bruin/pkg/pipeline"
 	"github.com/nikolalohinski/gonja/v2"
 	"github.com/nikolalohinski/gonja/v2/exec"
+	"github.com/nikolalohinski/gonja/v2/loaders"
 	"github.com/pkg/errors"
 	"github.com/spf13/afero"
 )
@@ -191,7 +195,7 @@ func (r *Renderer) Render(query string) (string, error) {
 		fullQuery = r.macroContent + "\n" + query
 	}
 
-	tpl, err := gonja.FromString(fullQuery)
+	tpl, err := compileSandboxed(fullQuery)
 	if err != nil {
 		r.queryRenderLock.Unlock()
 		customError := findParserErrorType(err)
@@ -220,6 +224,38 @@ func (r *Renderer) Render(query string) (string, error) {
 	}
 
 	return out, nil
+}
+
+// errTemplateFileAccessDenied is returned whenever a rendered template tries to
+// pull in another template from disk (via include/import/from/extends). gonja's
+// default loader reads arbitrary files relative to the process, so a
+// user-controlled template could otherwise read secrets off the host
+// (e.g. {% include "/proc/self/environ" %}). Templates are always rendered from
+// a string, so no legitimate render needs filesystem access.
+var errTemplateFileAccessDenied = errors.New("loading templates from the filesystem is disabled")
+
+// denyLoader is a gonja loader that refuses every filesystem access. It is used
+// as the sub-loader so that the root template still renders from its string
+// source while include/import/from/extends fail instead of reading host files.
+type denyLoader struct{}
+
+func (denyLoader) Read(string) (io.Reader, error) { return nil, errTemplateFileAccessDenied }
+
+func (denyLoader) Resolve(string) (string, error) { return "", errTemplateFileAccessDenied }
+
+func (denyLoader) Inherit(string) (loaders.Loader, error) { return nil, errTemplateFileAccessDenied }
+
+// compileSandboxed mirrors gonja.FromString but swaps gonja's unrestricted
+// filesystem loader for denyLoader.
+func compileSandboxed(source string) (*exec.Template, error) {
+	content := []byte(source)
+	rootID := "root-" + string(sha256.New().Sum(content))
+	loader, err := loaders.NewShiftedLoader(rootID, bytes.NewReader(content), denyLoader{})
+	if err != nil {
+		return nil, err
+	}
+
+	return exec.NewTemplate(rootID, gonja.DefaultConfig, loader, gonja.DefaultEnvironment)
 }
 
 func cleanupExcessiveNewlines(s string) string {
@@ -305,6 +341,10 @@ func (r *Renderer) CloneForAsset(ctx context.Context, pipe *pipeline.Pipeline, a
 
 func findRenderErrorType(err error) string {
 	message := err.Error()
+	if strings.Contains(message, errTemplateFileAccessDenied.Error()) {
+		return errTemplateFileAccessDenied.Error()
+	}
+
 	errorBits := strings.Split(message, ": ")
 	innermostErr := errorBits[len(errorBits)-1]
 
@@ -324,6 +364,10 @@ func findRenderErrorType(err error) string {
 
 func findParserErrorType(err error) string {
 	message := err.Error()
+
+	if strings.Contains(message, errTemplateFileAccessDenied.Error()) {
+		return errTemplateFileAccessDenied.Error()
+	}
 
 	if strings.Contains(message, "Unexpected EOF, expected tag else or endfor") {
 		match := locationRegex.FindString(message)
